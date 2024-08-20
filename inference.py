@@ -30,19 +30,24 @@ DEFAULT_AUDIO_CLIPS = {"audio_0": "data/audio/test.mp3"}
 DEFAULT_BBOX_SHIFT = 8
 DEFAULT_PREPARATION = False
 
-
 def write_video(frames, output_path, size, fps):
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
     for frame in frames:
         out.write(frame)
     out.release()
 
-
 def merge_audio(video_path, audio_path, output_path):
     subprocess.run([
         'ffmpeg', '-y', '-i', audio_path, '-i', video_path, '-c:v', 'copy', '-c:a', 'aac', output_path
     ], check=True)
 
+def create_hls_stream(video_path, output_dir, segment_time=10):
+    os.makedirs(output_dir, exist_ok=True)
+    subprocess.run([
+        'ffmpeg', '-y', '-i', video_path, '-c:v', 'libx264', '-c:a', 'aac', '-f', 'hls',
+        '-hls_time', str(segment_time), '-hls_playlist_type', 'vod',
+        os.path.join(output_dir, 'index.m3u8')
+    ], check=True)
 
 class AvatarInference:
     def __init__(self, avatar_id, video_path=DEFAULT_VIDEO_PATH, bbox_shift=DEFAULT_BBOX_SHIFT, 
@@ -141,7 +146,7 @@ class AvatarInference:
             size = (width, height)
 
             output_vid = os.path.join(self.video_out_path, f"{out_vid_name}.mp4")
-            combined_output = os.path.join(self.video_out_path, f"{out_vid_name}_with_audio.mp4")
+            hls_output_dir = os.path.join(self.video_out_path, f"{out_vid_name}_hls")
 
             # Write video frames in a separate thread
             video_thread = threading.Thread(target=write_video, args=(self.final_frames, output_vid, size, fps))
@@ -150,16 +155,15 @@ class AvatarInference:
             # Wait for the video to be written
             video_thread.join()
 
-            # Merge video and audio
-            merge_audio(output_vid, audio_path, combined_output)
+            # Create HLS streamable files
+            create_hls_stream(output_vid, hls_output_dir)
 
             # Clean up intermediate video file
             os.remove(output_vid)
 
-            print(f"Result saved to {combined_output}")
+            print(f"HLS stream saved to {hls_output_dir}")
 
         print(f"Inference completed in {time.time() - start_time} seconds.")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
