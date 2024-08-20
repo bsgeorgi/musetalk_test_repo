@@ -3,7 +3,6 @@ import os
 import numpy as np
 import cv2
 import torch
-import glob
 import pickle
 import json
 from tqdm import tqdm
@@ -30,33 +29,16 @@ DEFAULT_AUDIO_CLIPS = {"audio_0": "data/audio/test.mp3"}
 DEFAULT_BBOX_SHIFT = 8
 DEFAULT_PREPARATION = False
 
-def create_hls_stream(frames, audio_path, output_dir, size, fps, segment_time=10):
-    os.makedirs(output_dir, exist_ok=True)
+def write_video(frames, output_path, size, fps):
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
+    for frame in frames:
+        out.write(frame)
+    out.release()
 
-    # Create a named pipe for feeding video frames to FFmpeg
-    pipe_path = os.path.join(output_dir, 'video_pipe.y4m')
-    if not os.path.exists(pipe_path):
-        os.mkfifo(pipe_path)
-
-    # Start FFmpeg process for HLS creation
-    ffmpeg_command = [
-        'ffmpeg', '-y', '-f', 'yuv4mpegpipe', '-i', pipe_path,
-        '-i', audio_path, '-c:v', 'libx264', '-c:a', 'aac',
-        '-f', 'hls', '-hls_time', str(segment_time), '-hls_playlist_type', 'vod',
-        os.path.join(output_dir, 'index.m3u8')
-    ]
-    ffmpeg_process = subprocess.Popen(ffmpeg_command)
-
-    # Open the pipe and write video frames in YUV4MPEG format
-    with open(pipe_path, 'wb') as pipe:
-        header = f'YUV4MPEG2 W{size[0]} H{size[1]} F{fps}:1 Ip A0:0 C444\n'.encode()
-        pipe.write(header)
-        for frame in frames:
-            pipe.write(b'FRAME\n')
-            pipe.write(frame.tobytes())
-
-    ffmpeg_process.communicate()
-    os.remove(pipe_path)
+def merge_audio(video_path, audio_path, output_path):
+    subprocess.run([
+        'ffmpeg', '-y', '-i', audio_path, '-i', video_path, '-c:v', 'copy', '-c:a', 'aac', output_path
+    ], check=True)
 
 class AvatarInference:
     def __init__(self, avatar_id, video_path=DEFAULT_VIDEO_PATH, bbox_shift=DEFAULT_BBOX_SHIFT, 
@@ -86,7 +68,7 @@ class AvatarInference:
                 print(f"Re-creating avatar: {self.avatar_id}")
             else:
                 print(f"Creating avatar: {self.avatar_id}")
-            os.makedirs(self.avatar_path)
+            os.makedirs(self.avatar_path, exist_ok=True)
             self._prepare_material()
         else:
             if not os.path.exists(self.avatar_path):
@@ -97,30 +79,28 @@ class AvatarInference:
         self.input_latent_list_cycle = torch.load(self.latents_out_path)
         with open(self.coords_path, 'rb') as f:
             self.coord_list_cycle = pickle.load(f)
-        self.frame_list_cycle = read_imgs(sorted(glob.glob(os.path.join(self.full_imgs_path, '*.png'))))
+        self.frame_list_cycle = read_imgs(sorted(glob.glob(f"{self.full_imgs_path}/*.png")))
         with open(self.mask_coords_path, 'rb') as f:
             self.mask_coords_list_cycle = pickle.load(f)
-        self.mask_list_cycle = read_imgs(sorted(glob.glob(os.path.join(self.mask_out_path, '*.png'))))
+        self.mask_list_cycle = read_imgs(sorted(glob.glob(f"{self.mask_out_path}/*.png")))
 
     def _process_frames(self, res_frame_queue, video_len):
         self.final_frames = []
-        self.idx = 0
-        while self.idx < video_len - 1:
+        for idx in range(video_len):
             try:
                 res_frame = res_frame_queue.get(timeout=1)
             except queue.Empty:
                 continue
 
-            bbox = self.coord_list_cycle[self.idx % len(self.coord_list_cycle)]
-            ori_frame = self.frame_list_cycle[self.idx % len(self.frame_list_cycle)]
-            mask = self.mask_list_cycle[self.idx % len(self.mask_list_cycle)]
-            mask_crop_box = self.mask_coords_list_cycle[self.idx % len(self.mask_coords_list_cycle)]
+            bbox = self.coord_list_cycle[idx % len(self.coord_list_cycle)]
+            ori_frame = self.frame_list_cycle[idx % len(self.frame_list_cycle)]
+            mask = self.mask_list_cycle[idx % len(self.mask_list_cycle)]
+            mask_crop_box = self.mask_coords_list_cycle[idx % len(self.mask_coords_list_cycle)]
 
             res_frame = cv2.resize(res_frame.astype(np.uint8), (bbox[2] - bbox[0], bbox[3] - bbox[1]))
             combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
 
             self.final_frames.append(combined_frame)
-            self.idx += 1
 
     def inference(self, audio_path, out_vid_name, fps):
         print("Starting inference...")
@@ -128,7 +108,7 @@ class AvatarInference:
         start_time = time.time()
         whisper_feature = audio_processor.audio2feat(audio_path)
         whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
-        print(f"Audio processing took {(time.time() - start_time) * 1000}ms")
+        print(f"Audio processing took {(time.time() - start_time) * 1000:.2f}ms")
 
         video_num = len(whisper_chunks)
         res_frame_queue = queue.Queue()
@@ -136,7 +116,6 @@ class AvatarInference:
         process_thread.start()
 
         gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
-        start_time = time.time()
 
         for whisper_batch, latent_batch in tqdm(gen, total=int(np.ceil(float(video_num) / self.batch_size))):
             audio_feature_batch = torch.from_numpy(whisper_batch).to(device=device, dtype=unet.model.dtype)
@@ -154,14 +133,19 @@ class AvatarInference:
             height, width, _ = self.final_frames[0].shape
             size = (width, height)
 
-            hls_output_dir = os.path.join(self.video_out_path, f"{out_vid_name}_hls")
+            output_vid = f"{self.video_out_path}{out_vid_name}.mp4"
+            combined_output = f"{self.video_out_path}{out_vid_name}_with_audio.mp4"
 
-            # Create HLS streamable files directly from frames
-            create_hls_stream(self.final_frames, audio_path, hls_output_dir, size, fps)
+            # Write video frames
+            write_video(self.final_frames, output_vid, size, fps)
 
-            print(f"HLS stream saved to {hls_output_dir}")
+            # Merge video and audio
+            merge_audio(output_vid, audio_path, combined_output)
 
-        print(f"Inference completed in {time.time() - start_time} seconds.")
+            # Clean up intermediate video file
+            os.remove(output_vid)
+
+        print(f"Inference completed in {time.time() - start_time:.2f} seconds.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
