@@ -1,9 +1,9 @@
 import argparse
 import os
-import glob
 import numpy as np
 import cv2
 import torch
+import glob
 import pickle
 import json
 from tqdm import tqdm
@@ -30,16 +30,19 @@ DEFAULT_AUDIO_CLIPS = {"audio_0": "data/audio/test.mp3"}
 DEFAULT_BBOX_SHIFT = 8
 DEFAULT_PREPARATION = False
 
+
 def write_video(frames, output_path, size, fps):
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
     for frame in frames:
         out.write(frame)
     out.release()
 
+
 def merge_audio(video_path, audio_path, output_path):
     subprocess.run([
         'ffmpeg', '-y', '-i', audio_path, '-i', video_path, '-c:v', 'copy', '-c:a', 'aac', output_path
     ], check=True)
+
 
 class AvatarInference:
     def __init__(self, avatar_id, video_path=DEFAULT_VIDEO_PATH, bbox_shift=DEFAULT_BBOX_SHIFT, 
@@ -69,7 +72,7 @@ class AvatarInference:
                 print(f"Re-creating avatar: {self.avatar_id}")
             else:
                 print(f"Creating avatar: {self.avatar_id}")
-            os.makedirs(self.avatar_path, exist_ok=True)
+            os.makedirs(self.avatar_path)
             self._prepare_material()
         else:
             if not os.path.exists(self.avatar_path):
@@ -80,28 +83,30 @@ class AvatarInference:
         self.input_latent_list_cycle = torch.load(self.latents_out_path)
         with open(self.coords_path, 'rb') as f:
             self.coord_list_cycle = pickle.load(f)
-        self.frame_list_cycle = read_imgs(sorted(glob.glob(f"{self.full_imgs_path}/*.png")))
+        self.frame_list_cycle = read_imgs(sorted(glob.glob(os.path.join(self.full_imgs_path, '*.png'))))
         with open(self.mask_coords_path, 'rb') as f:
             self.mask_coords_list_cycle = pickle.load(f)
-        self.mask_list_cycle = read_imgs(sorted(glob.glob(f"{self.mask_out_path}/*.png")))
+        self.mask_list_cycle = read_imgs(sorted(glob.glob(os.path.join(self.mask_out_path, '*.png'))))
 
     def _process_frames(self, res_frame_queue, video_len):
         self.final_frames = []
-        for idx in range(video_len):
+        self.idx = 0
+        while self.idx < video_len - 1:
             try:
                 res_frame = res_frame_queue.get(timeout=1)
             except queue.Empty:
                 continue
 
-            bbox = self.coord_list_cycle[idx % len(self.coord_list_cycle)]
-            ori_frame = self.frame_list_cycle[idx % len(self.frame_list_cycle)]
-            mask = self.mask_list_cycle[idx % len(self.mask_list_cycle)]
-            mask_crop_box = self.mask_coords_list_cycle[idx % len(self.mask_coords_list_cycle)]
+            bbox = self.coord_list_cycle[self.idx % len(self.coord_list_cycle)]
+            ori_frame = self.frame_list_cycle[self.idx % len(self.frame_list_cycle)]
+            mask = self.mask_list_cycle[self.idx % len(self.mask_list_cycle)]
+            mask_crop_box = self.mask_coords_list_cycle[self.idx % len(self.mask_coords_list_cycle)]
 
             res_frame = cv2.resize(res_frame.astype(np.uint8), (bbox[2] - bbox[0], bbox[3] - bbox[1]))
             combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
 
             self.final_frames.append(combined_frame)
+            self.idx += 1
 
     def inference(self, audio_path, out_vid_name, fps):
         print("Starting inference...")
@@ -109,7 +114,7 @@ class AvatarInference:
         start_time = time.time()
         whisper_feature = audio_processor.audio2feat(audio_path)
         whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
-        print(f"Audio processing took {(time.time() - start_time) * 1000:.2f}ms")
+        print(f"Audio processing took {(time.time() - start_time) * 1000}ms")
 
         video_num = len(whisper_chunks)
         res_frame_queue = queue.Queue()
@@ -117,6 +122,7 @@ class AvatarInference:
         process_thread.start()
 
         gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
+        start_time = time.time()
 
         for whisper_batch, latent_batch in tqdm(gen, total=int(np.ceil(float(video_num) / self.batch_size))):
             audio_feature_batch = torch.from_numpy(whisper_batch).to(device=device, dtype=unet.model.dtype)
@@ -134,11 +140,15 @@ class AvatarInference:
             height, width, _ = self.final_frames[0].shape
             size = (width, height)
 
-            output_vid = f"{self.video_out_path}{out_vid_name}.mp4"
-            combined_output = f"{self.video_out_path}{out_vid_name}_with_audio.mp4"
+            output_vid = os.path.join(self.video_out_path, f"{out_vid_name}.mp4")
+            combined_output = os.path.join(self.video_out_path, f"{out_vid_name}_with_audio.mp4")
 
-            # Write video frames
-            write_video(self.final_frames, output_vid, size, fps)
+            # Write video frames in a separate thread
+            video_thread = threading.Thread(target=write_video, args=(self.final_frames, output_vid, size, fps))
+            video_thread.start()
+
+            # Wait for the video to be written
+            video_thread.join()
 
             # Merge video and audio
             merge_audio(output_vid, audio_path, combined_output)
@@ -146,7 +156,10 @@ class AvatarInference:
             # Clean up intermediate video file
             os.remove(output_vid)
 
-        print(f"Inference completed in {time.time() - start_time:.2f} seconds.")
+            print(f"Result saved to {combined_output}")
+
+        print(f"Inference completed in {time.time() - start_time} seconds.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
