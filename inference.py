@@ -30,24 +30,33 @@ DEFAULT_AUDIO_CLIPS = {"audio_0": "data/audio/test.mp3"}
 DEFAULT_BBOX_SHIFT = 8
 DEFAULT_PREPARATION = False
 
-def write_video(frames, output_path, size, fps):
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
-    for frame in frames:
-        out.write(frame)
-    out.release()
-
-def merge_audio(video_path, audio_path, output_path):
-    subprocess.run([
-        'ffmpeg', '-y', '-i', audio_path, '-i', video_path, '-c:v', 'copy', '-c:a', 'aac', output_path
-    ], check=True)
-
-def create_hls_stream(video_path, output_dir, segment_time=10):
+def create_hls_stream(frames, audio_path, output_dir, size, fps, segment_time=10):
     os.makedirs(output_dir, exist_ok=True)
-    subprocess.run([
-        'ffmpeg', '-y', '-i', video_path, '-c:v', 'libx264', '-c:a', 'aac', '-f', 'hls',
-        '-hls_time', str(segment_time), '-hls_playlist_type', 'vod',
+
+    # Create a named pipe for feeding video frames to FFmpeg
+    pipe_path = os.path.join(output_dir, 'video_pipe.y4m')
+    if not os.path.exists(pipe_path):
+        os.mkfifo(pipe_path)
+
+    # Start FFmpeg process for HLS creation
+    ffmpeg_command = [
+        'ffmpeg', '-y', '-f', 'yuv4mpegpipe', '-i', pipe_path,
+        '-i', audio_path, '-c:v', 'libx264', '-c:a', 'aac',
+        '-f', 'hls', '-hls_time', str(segment_time), '-hls_playlist_type', 'vod',
         os.path.join(output_dir, 'index.m3u8')
-    ], check=True)
+    ]
+    ffmpeg_process = subprocess.Popen(ffmpeg_command)
+
+    # Open the pipe and write video frames in YUV4MPEG format
+    with open(pipe_path, 'wb') as pipe:
+        header = f'YUV4MPEG2 W{size[0]} H{size[1]} F{fps}:1 Ip A0:0 C444\n'.encode()
+        pipe.write(header)
+        for frame in frames:
+            pipe.write(b'FRAME\n')
+            pipe.write(frame.tobytes())
+
+    ffmpeg_process.communicate()
+    os.remove(pipe_path)
 
 class AvatarInference:
     def __init__(self, avatar_id, video_path=DEFAULT_VIDEO_PATH, bbox_shift=DEFAULT_BBOX_SHIFT, 
@@ -145,21 +154,10 @@ class AvatarInference:
             height, width, _ = self.final_frames[0].shape
             size = (width, height)
 
-            output_vid = os.path.join(self.video_out_path, f"{out_vid_name}.mp4")
             hls_output_dir = os.path.join(self.video_out_path, f"{out_vid_name}_hls")
 
-            # Write video frames in a separate thread
-            video_thread = threading.Thread(target=write_video, args=(self.final_frames, output_vid, size, fps))
-            video_thread.start()
-
-            # Wait for the video to be written
-            video_thread.join()
-
-            # Create HLS streamable files
-            create_hls_stream(output_vid, hls_output_dir)
-
-            # Clean up intermediate video file
-            os.remove(output_vid)
+            # Create HLS streamable files directly from frames
+            create_hls_stream(self.final_frames, audio_path, hls_output_dir, size, fps)
 
             print(f"HLS stream saved to {hls_output_dir}")
 
@@ -168,7 +166,7 @@ class AvatarInference:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fps", type=int, default=25)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default 8)
     parser.add_argument("--video_path", type=str, default=DEFAULT_VIDEO_PATH)
     parser.add_argument("--audio_clips", type=json.loads, default=json.dumps(DEFAULT_AUDIO_CLIPS))
     parser.add_argument("--bbox_shift", type=int, default=DEFAULT_BBOX_SHIFT)
