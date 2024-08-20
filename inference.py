@@ -166,7 +166,7 @@ class AvatarInference:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fps", type=int, default=25)
-    parser.add_argument("--batch_size", type=int, default 8)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--video_path", type=str, default=DEFAULT_VIDEO_PATH)
     parser.add_argument("--audio_clips", type=json.loads, default=json.dumps(DEFAULT_AUDIO_CLIPS))
     parser.add_argument("--bbox_shift", type=int, default=DEFAULT_BBOX_SHIFT)
